@@ -1,9 +1,4 @@
 class Metrics:
-    url
-    load_time
-    memory_usage
-    cpu_time
-
     def __init__(self, url, load_time, memory_usage, cpu_time):
         self.url = url
         self.load_time = load_time

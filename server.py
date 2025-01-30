@@ -1,13 +1,43 @@
 import socket
-import json
-import pickle
+import sqlite3
 from Metrics import Metrics
+from networkutils import send_pickle, recv_pickle  # Import the shared functions
 
-HOST = '127.0.0.1'  # Localhost
-PORT = 65432        # Port to listen on
+HOST = '127.0.0.1'
+PORT = 65432
 
+def initialize_database():
+    """Creates the SQLite database and metrics table if they don't exist."""
+    conn = sqlite3.connect("metrics.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT,
+            load_time REAL,
+            memory_usage REAL,
+            cpu_time REAL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def insert_metrics(metrics):
+    """Inserts received metrics into the SQLite database."""
+    conn = sqlite3.connect("metrics.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO metrics (url, load_time, memory_usage, cpu_time)
+        VALUES (?, ?, ?, ?)
+    ''', (metrics.url, metrics.load_time, metrics.memory_usage, metrics.cpu_time))
+    conn.commit()
+    conn.close()
 
 def start_server():
+    """Starts the server, listens for connections, and processes client requests."""
+    initialize_database()  # Ensure the database is set up
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.bind((HOST, PORT))
         server_socket.listen()
@@ -19,53 +49,30 @@ def start_server():
             print(f"Connected by {addr}")
             with conn:
                 while True:
-                    decision = input("Type 1 for database access and 2 to input a url: (or type 'exit' to quit) ")
-                    if decision.lower() == 'exit':
+                    url = input("Enter the URL to test (or type 'exit' to quit): ").strip()
+                    if url.lower() == "exit":
                         print("Shutting down the server.")
-                        conn.sendall(b'exit')
-                        return  # Exit the entire server loop
-                    elif decision == '1':
-                        #database access should go here
-                    elif decision == '2':
-                        # Send URL to the client
-                        url = input("Enter the URL to test (or type 'exit' to quit): ").strip()
-                        if url.lower() == "exit":
-                            print("Shutting down the server.")
-                            conn.sendall(b'exit')
-                            return  # Exit the entire server loop
+                        send_pickle(conn, "exit")  # Notify client to exit
+                        return  # Exit the server
 
-                        conn.sendall(url.encode())
+                    send_pickle(conn, url)  # Send the URL to the client
 
-                        # Receive metrics line by line
-                        buffer = ""
-                        while True:
-                            try:
-                                data = conn.recv(1024).decode()
-                                if not data:
-                                    print("Client disconnected.")
-                                    return  # Stop processing if the client disconnects
+                    while True:
+                        metrics = recv_pickle(conn)  # Receive pickled Metrics object
+                        if metrics is None:
+                            print("Client disconnected.")
+                            return
 
-                                buffer += data
-                                while "\n" in buffer:  # Process each line in the buffer
-                                    line, buffer = buffer.split("\n", 1)
-                                    if line == "DONE":
-                                        print("All metrics received for the URL.")
-                                        break
-                                    try:
-                                        metrics = json.loads(line)
-                                        print(f"Received metrics: {metrics}")
-                                    except json.JSONDecodeError:
-                                        print(f"Failed to decode line: {line}")
-                                if "DONE" in line:
-                                    break  # Exit inner loop when "DONE" is received
-                            except ConnectionResetError:
-                                print("Connection with client was reset.")
-                                return
+                        if isinstance(metrics, str) and metrics == "DONE":
+                            print("All metrics received for the URL.")
+                            break
 
+                        if isinstance(metrics, Metrics):
+                            print(f"Received Metrics Object: URL={metrics.url}, Load Time={metrics.load_time:.2f}s, "
+                                  f"Memory={metrics.memory_usage:.2f}MB, CPU Time={metrics.cpu_time:.2f}s")
 
-def main():
-    start_server()
-
+                            insert_metrics(metrics)  # Store in SQLite
+                            print("Metrics inserted into the database.")
 
 if __name__ == "__main__":
-    main()
+    start_server()
