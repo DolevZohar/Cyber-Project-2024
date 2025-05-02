@@ -4,19 +4,24 @@ from Metrics import Metrics
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from networkutils import send_pickle, recv_pickle  # Import the shared functions
+from networkutils import send_pickle, recv_pickle
 import requests
 from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import StaleElementReferenceException
 
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 65432
 
 def setup_browser():
-        chrome_options = Options()
-        chrome_options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-        service = Service()
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        return driver
+    chrome_options = Options()
+    chrome_options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    service = Service()
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
 
 def safe_metric(name, func, metrics_dict, failed_list):
     try:
@@ -24,12 +29,13 @@ def safe_metric(name, func, metrics_dict, failed_list):
     except Exception as e:
         print(f"[x] Failed to collect '{name}': {e}")
         failed_list.append(name)
+        metrics_dict[name] = None
 
-
-def track_statistics(url, driver):
+def track_statistics(url, driver, session):
     driver.execute_cdp_cmd("Performance.disable", {})
     driver.execute_cdp_cmd("Performance.setTimeDomain", {"timeDomain": "threadTicks"})
     driver.execute_cdp_cmd("Performance.enable", {})
+    driver.execute_cdp_cmd('Network.enable', {})
 
     driver.get(url)
 
@@ -74,37 +80,55 @@ def track_statistics(url, driver):
         )
 
     def get_total_script_size():
-        logs = driver.get_log("performance")
-        total_bytes = 0
-        for entry in logs:
-            log = json.loads(entry["message"])["message"]
-            if log["method"] == "Network.loadingFinished":
-                request_id = log["params"]["requestId"]
-                match = next((e for e in logs if json.loads(e["message"])["message"]
-                              .get("params", {}).get("requestId") == request_id and
-                              json.loads(e["message"])["message"].get("method") == "Network.responseReceived"), None)
-                if match:
-                    type_ = json.loads(match["message"])["message"]["params"]["type"]
-                    if type_ == "Script":
-                        total_bytes += log["params"].get("encodedDataLength", 0)
-        return total_bytes / (1024 * 1024)
+        # Wait for script elements to be present in the DOM
+        WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.TAG_NAME, "script")))
+        scripts = driver.find_elements("tag name", "script")
+        total_script_bytes = 0
+        inline_script_bytes = 0
+
+        for script in scripts:
+            try:
+                src = script.get_attribute("src")
+                if src:
+                    try:
+                        response = requests.get(src, timeout=5)
+                        total_script_bytes += len(response.content)
+                    except requests.RequestException:
+                        continue
+                else:
+                    inner = driver.execute_script("return arguments[0].innerText;", script)
+                    inline_script_bytes += len(inner or "")
+            except StaleElementReferenceException:
+                continue  # Skip this script tag if it became stale
+
+        total_script_bytes += inline_script_bytes
+        return total_script_bytes / (1024 * 1024)  # Return size in MB
 
     def get_broken_links():
         links = driver.find_elements("tag name", "a")
+        hrefs = [link.get_attribute("href") for link in links if link.get_attribute("href")]
+        full_urls = [urljoin(driver.current_url, href) for href in hrefs]
         broken = []
-        for link in links:
-            href = link.get_attribute("href")
-            if href:
-                full_url = urljoin(driver.current_url, href)
-                try:
-                    response = requests.head(full_url, allow_redirects=True, timeout=5)
-                    if response.status_code >= 400:
-                        broken.append(full_url)
-                except requests.RequestException:
-                    broken.append(full_url)
+
+        def check_link(url):
+            try:
+                response = session.head(url, allow_redirects=True, timeout=5)
+                if response.status_code >= 400:
+                    return url
+            except requests.RequestException:
+                return url
+            return None
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_url = {executor.submit(check_link, url): url for url in full_urls}
+            for future in as_completed(future_to_url):
+                result = future.result()
+                if result:
+                    broken.append(result)
+
         return broken
 
-    # Add all metric collectors here
+    # Run all metrics
     safe_metric("load_time", get_load_time, metrics_data, failed_metrics)
     safe_metric("memory_usage", get_memory_usage, metrics_data, failed_metrics)
     safe_metric("cpu_time", get_cpu_time, metrics_data, failed_metrics)
@@ -116,16 +140,16 @@ def track_statistics(url, driver):
     safe_metric("broken_links", get_broken_links, metrics_data, failed_metrics)
 
     driver.execute_cdp_cmd("Performance.disable", {})
+
     metrics_data["failed_metrics"] = failed_metrics
     return Metrics(url, **metrics_data)
-
-
-
 
 def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
         client_socket.connect((SERVER_HOST, SERVER_PORT))
         print("Connected to the server.")
+
+        session = requests.Session()
 
         while True:
             url = recv_pickle(client_socket)
@@ -139,25 +163,24 @@ def main():
             for i in range(5):
                 driver = setup_browser()
                 try:
-                    metrics_obj = track_statistics(url, driver)
+                    metrics_obj = track_statistics(url, driver, session)
                     send_pickle(client_socket, metrics_obj)
 
                     print(f"Run {i + 1} - "
-                          f"Load Time: {getattr(metrics_obj, 'load_time', 'N/A'):.2f}s, "
-                          f"FCP: {getattr(metrics_obj, 'fcp', 'N/A'):.2f}s, "
-                          f"Memory: {getattr(metrics_obj, 'memory_usage', 'N/A'):.2f}MB, "
-                          f"CPU Time: {getattr(metrics_obj, 'cpu_time', 'N/A'):.2f}s, "
-                          f"DOM Nodes: {getattr(metrics_obj, 'dom_nodes', 'N/A')}, "
-                          f"Page Size: {getattr(metrics_obj, 'total_page_size', 'N/A'):.2f}MB, "
-                          f"Script Size: {getattr(metrics_obj, 'script_size', 'N/A'):.2f}MB, "
-                          f"Requests: {getattr(metrics_obj, 'network_requests', 'N/A')}, "
-                          f"Broken Links: {len(getattr(metrics_obj, 'broken_links', []))}")
+                          f"Load Time: {metrics_obj.load_time:.2f}s, "
+                          f"FCP: {metrics_obj.fcp:.2f}s, "
+                          f"Memory: {metrics_obj.memory_usage:.2f}MB, "
+                          f"CPU Time: {metrics_obj.cpu_time:.2f}s, "
+                          f"DOM Nodes: {metrics_obj.dom_nodes}, "
+                          f"Page Size: {metrics_obj.total_page_size:.2f}MB, "
+                          f"Script Size: {metrics_obj.script_size:.2f}MB, "
+                          f"Requests: {metrics_obj.network_requests}, "
+                          f"Broken Links: {len(metrics_obj.broken_links)}")
                 finally:
                     driver.quit()
 
             send_pickle(client_socket, "DONE")
             print("All metrics sent to the server.")
-
 
 if __name__ == "__main__":
     main()
