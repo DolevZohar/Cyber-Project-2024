@@ -14,7 +14,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException
 
 SERVER_HOST = '127.0.0.1'
-SERVER_PORT = 65432
+PERMANENT_PORT = 65431  # Fixed port for initial handshake
+
 
 def setup_browser():
     chrome_options = Options()
@@ -23,6 +24,7 @@ def setup_browser():
     driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
 
+
 def safe_metric(name, func, metrics_dict, failed_list):
     try:
         metrics_dict[name] = func()
@@ -30,6 +32,7 @@ def safe_metric(name, func, metrics_dict, failed_list):
         print(f"[x] Failed to collect '{name}': {e}")
         failed_list.append(name)
         metrics_dict[name] = None
+
 
 def track_statistics(url, driver, session):
     driver.execute_cdp_cmd("Performance.disable", {})
@@ -144,13 +147,25 @@ def track_statistics(url, driver, session):
     metrics_data["failed_metrics"] = failed_metrics
     return Metrics(url, **metrics_data)
 
+
+def connect_to_server():
+    handshake_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    handshake_socket.connect((SERVER_HOST, PERMANENT_PORT))
+    dynamic_port = recv_pickle(handshake_socket)
+    print(f"Received dynamic port: {dynamic_port}")
+    handshake_socket.close()
+
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.connect((SERVER_HOST, dynamic_port))
+    print(f"Connected to server on dynamic port: {dynamic_port}")
+    return server_socket
+
+
 def main():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
-        client_socket.connect((SERVER_HOST, SERVER_PORT))
-        print("Connected to the server.")
+    client_socket = connect_to_server()
+    session = requests.Session()
 
-        session = requests.Session()
-
+    try:
         while True:
             url = recv_pickle(client_socket)
 
@@ -160,11 +175,13 @@ def main():
 
             print(f"Received URL to test: {url}")
 
+            all_metrics = []
+
             for i in range(5):
                 driver = setup_browser()
                 try:
                     metrics_obj = track_statistics(url, driver, session)
-                    send_pickle(client_socket, metrics_obj)
+                    all_metrics.append(metrics_obj)
 
                     print(f"Run {i + 1} - "
                           f"Load Time: {metrics_obj.load_time:.2f}s, "
@@ -179,8 +196,15 @@ def main():
                 finally:
                     driver.quit()
 
+            # Now send all metrics back to the server at once
+            for metrics_obj in all_metrics:
+                send_pickle(client_socket, metrics_obj)
+
             send_pickle(client_socket, "DONE")
             print("All metrics sent to the server.")
+    finally:
+        client_socket.close()
+
 
 if __name__ == "__main__":
     main()

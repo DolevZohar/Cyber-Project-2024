@@ -1,13 +1,17 @@
 import socket
 import sqlite3
 import requests
+import threading
 from Metrics import Metrics
 from networkutils import send_pickle, recv_pickle
+from datetime import datetime
 
 HOST = '127.0.0.1'
-PORT = 65432
+PERMANENT_PORT = 65431
+shutdown_event = threading.Event()
+clients_threads = []
 
-def initialize_database():
+def initialize_databases():
     conn = sqlite3.connect("metrics.db")
     cursor = conn.cursor()
     cursor.execute('''
@@ -29,6 +33,18 @@ def initialize_database():
     conn.commit()
     conn.close()
 
+    conn = sqlite3.connect("urls.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS urls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE,
+            last_checked DATETIME DEFAULT '1970-01-01 00:00:00'
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
 
 def insert_metrics(metrics):
     conn = sqlite3.connect("metrics.db")
@@ -37,8 +53,7 @@ def insert_metrics(metrics):
         INSERT INTO metrics (
             url, load_time, memory_usage, cpu_time, dom_nodes,
             total_page_size, fcp, network_requests, script_size, broken_links
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         metrics.url,
         getattr(metrics, 'load_time', None),
@@ -55,7 +70,23 @@ def insert_metrics(metrics):
     conn.close()
 
 
-# A function to follow redirections
+def get_oldest_url():
+    conn = sqlite3.connect("urls.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT url FROM urls ORDER BY last_checked ASC LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def update_last_checked(url):
+    conn = sqlite3.connect("urls.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE urls SET last_checked = CURRENT_TIMESTAMP WHERE url = ?", (url,))
+    conn.commit()
+    conn.close()
+
+
 def resolve_final_url(input_url):
     if not input_url.startswith("http://") and not input_url.startswith("https://"):
         input_url = "https://" + input_url
@@ -66,58 +97,132 @@ def resolve_final_url(input_url):
         print(f"Failed to resolve URL: {e}")
         return None
 
+
+def handle_client(conn, addr, dynamic_port):
+    with conn:
+        try:
+            print(f"Sent dynamic port {dynamic_port} to client {addr}")
+
+            url = get_oldest_url()
+            if not url:
+                print("No URLs in database. Add some via the dashboard.")
+                send_pickle(conn, "exit")
+                return
+
+            normalized_url = resolve_final_url(url)
+            if not normalized_url:
+                print("Invalid or unreachable URL.")
+                send_pickle(conn, "exit")
+                return
+
+            send_pickle(conn, normalized_url)
+
+            all_metrics = []
+            for _ in range(5):
+                metrics = recv_pickle(conn)
+                if metrics is None:
+                    print("Client disconnected.")
+                    return
+                if isinstance(metrics, Metrics):
+                    print(f"Metrics received for {metrics.url}")
+                    all_metrics.append(metrics)
+                else:
+                    print("Received unexpected data instead of metrics.")
+                    return
+
+            for metrics in all_metrics:
+                insert_metrics(metrics)
+
+            print(f"Inserted metrics for {url}. Waiting for 'DONE' signal...")
+
+            done_signal = recv_pickle(conn)
+            if done_signal == "DONE":
+                print("Received 'DONE' from client.")
+                update_last_checked(normalized_url)
+                print(f"Updated last checked for {normalized_url}")
+
+            send_pickle(conn, "exit")
+            print(f"Sent 'exit' to client {addr} to complete shutdown.")
+        except Exception as e:
+            print(f"Error handling client {addr}: {e}")
+        finally:
+            print(f"[Thread Exit] Client thread for {addr} exiting.")
+
+
+def console_listener():
+    while not shutdown_event.is_set():
+        command = input()
+        if command.strip().lower() in ("exit", "shutdown"):
+            print("Shutdown command received.")
+            shutdown_event.set()
+    print("[Thread Exit] Console listener thread exiting.")
+
+
+def accept_dynamic_client(dynamic_socket, dynamic_port):
+    try:
+        conn, addr = dynamic_socket.accept()
+        print(f"[+] Client connected on dynamic port {dynamic_port} from {addr}")
+        handle_client(conn, addr, dynamic_port)
+    except Exception as e:
+        print(f"[!] Error accepting client on port {dynamic_port}: {e}")
+    finally:
+        dynamic_socket.close()
+        print(f"[Thread Exit] accept_dynamic_client thread for port {dynamic_port} exiting.")
+
+
 def start_server():
-    initialize_database()
+    initialize_databases()
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        server_socket.bind((HOST, PORT))
-        server_socket.listen()
-        print(f"Server started. Listening on {HOST}:{PORT}")
+    console_thread = threading.Thread(target=console_listener)
+    console_thread.start()
 
-        while True:
-            print("Waiting for a client to connect...")
-            conn, addr = server_socket.accept()
-            print(f"Connected by {addr}")
-            with conn:
-                while True:
-                    url = input("Enter the URL to test (or type 'exit' to quit): ").strip()
-                    if url.lower() == "exit":
-                        print("Shutting down the server.")
-                        send_pickle(conn, "exit")
-                        return
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handshake_socket:
+        handshake_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        handshake_socket.bind((HOST, PERMANENT_PORT))
+        handshake_socket.listen()
 
-                    normalized_url = resolve_final_url(url)
-                    if not normalized_url:
-                        print("Invalid or unreachable URL. Try again.")
-                        continue
+        print(f"Server started. Handshake listener on {HOST}:{PERMANENT_PORT}")
 
-                    send_pickle(conn, normalized_url)
+        try:
+            while not shutdown_event.is_set():
+                handshake_socket.settimeout(1.0)  # Allow periodic check for shutdown_event
+                try:
+                    handshake_conn, handshake_addr = handshake_socket.accept()
+                except socket.timeout:
+                    continue
 
-                    while True:
-                        metrics = recv_pickle(conn)
-                        if metrics is None:
-                            print("Client disconnected.")
-                            return
+                print(f"[+] Handshake from {handshake_addr}")
 
-                        if isinstance(metrics, str) and metrics == "DONE":
-                            print("All metrics received for the URL.")
-                            break
+                dynamic_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                dynamic_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                dynamic_socket.bind((HOST, 0))
+                dynamic_port = dynamic_socket.getsockname()[1]
+                dynamic_socket.listen()
 
-                        if isinstance(metrics, Metrics):
-                            print(f"--- Metrics Received ---\n"
-                                  f"URL: {metrics.url}\n"
-                                  f"Load Time: {getattr(metrics, 'load_time', 'N/A'):.2f}s\n"
-                                  f"FCP: {getattr(metrics, 'fcp', 'N/A'):.2f}s\n"
-                                  f"Memory Usage: {getattr(metrics, 'memory_usage', 'N/A'):.2f}MB\n"
-                                  f"CPU Time: {getattr(metrics, 'cpu_time', 'N/A'):.2f}s\n"
-                                  f"DOM Nodes: {getattr(metrics, 'dom_nodes', 'N/A')}\n"
-                                  f"Total Page Size: {getattr(metrics, 'total_page_size', 'N/A'):.2f}MB\n"
-                                  f"Script Size: {getattr(metrics, 'script_size', 'N/A'):.2f}MB\n"
-                                  f"Network Requests: {getattr(metrics, 'network_requests', 'N/A')}\n"
-                                  f"Broken Links: {len(getattr(metrics, 'broken_links', []))}\n")
+                send_pickle(handshake_conn, dynamic_port)
+                handshake_conn.close()
 
-                            insert_metrics(metrics)
-                            print("Metrics inserted into the database.")
+                client_thread = threading.Thread(
+                    target=accept_dynamic_client,
+                    args=(dynamic_socket, dynamic_port)
+                )
+                client_thread.start()
+                clients_threads.append(client_thread)
+
+        except Exception as e:
+            print(f"[!] Handshake loop error: {e}")
+
+        print("Waiting for all client threads to finish...")
+        for i, thread in enumerate(clients_threads):
+            print(f"Waiting on client thread #{i}")
+            thread.join()
+            print(f"Client thread #{i} joined.")
+
+        print("All client threads finished.")
+        shutdown_event.set()
+        console_thread.join()
+        print("Console thread finished.")
+        print("Server shut down cleanly.")
 
 
 if __name__ == "__main__":
