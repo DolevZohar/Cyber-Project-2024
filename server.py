@@ -100,49 +100,41 @@ def resolve_final_url(input_url):
 
 def handle_client(conn, addr, dynamic_port):
     with conn:
+        print(f"Sent dynamic port {dynamic_port} to client {addr}")
         try:
-            print(f"Sent dynamic port {dynamic_port} to client {addr}")
+            while not shutdown_event.is_set():
+                url = get_oldest_url()
+                if not url:
+                    print("No URLs in database. Add some via the dashboard.")
+                    send_pickle(conn, "exit")
+                    break
 
-            url = get_oldest_url()
-            if not url:
-                print("No URLs in database. Add some via the dashboard.")
-                send_pickle(conn, "exit")
-                return
+                normalized_url = resolve_final_url(url)
+                if not normalized_url:
+                    print("Invalid or unreachable URL.")
+                    send_pickle(conn, "exit")
+                    break
 
-            normalized_url = resolve_final_url(url)
-            if not normalized_url:
-                print("Invalid or unreachable URL.")
-                send_pickle(conn, "exit")
-                return
+                send_pickle(conn, normalized_url)
 
-            send_pickle(conn, normalized_url)
-
-            all_metrics = []
-            for _ in range(5):
-                metrics = recv_pickle(conn)
-                if metrics is None:
-                    print("Client disconnected.")
-                    return
-                if isinstance(metrics, Metrics):
-                    print(f"Metrics received for {metrics.url}")
+                all_metrics = []
+                for _ in range(5):
+                    metrics = recv_pickle(conn)
+                    if metrics is None or not isinstance(metrics, Metrics):
+                        print("Client sent invalid or no data.")
+                        return
                     all_metrics.append(metrics)
-                else:
-                    print("Received unexpected data instead of metrics.")
-                    return
 
-            for metrics in all_metrics:
-                insert_metrics(metrics)
+                for metrics in all_metrics:
+                    insert_metrics(metrics)
 
-            print(f"Inserted metrics for {url}. Waiting for 'DONE' signal...")
+                print(f"Inserted metrics for {url}. Waiting for 'DONE' signal...")
 
-            done_signal = recv_pickle(conn)
-            if done_signal == "DONE":
-                print("Received 'DONE' from client.")
-                update_last_checked(normalized_url)
-                print(f"Updated last checked for {normalized_url}")
-
-            send_pickle(conn, "exit")
-            print(f"Sent 'exit' to client {addr} to complete shutdown.")
+                done_signal = recv_pickle(conn)
+                if done_signal == "DONE":
+                    print("Received 'DONE' from client.")
+                    update_last_checked(normalized_url)
+                    print(f"Updated last checked for {normalized_url}")
         except Exception as e:
             print(f"Error handling client {addr}: {e}")
         finally:
