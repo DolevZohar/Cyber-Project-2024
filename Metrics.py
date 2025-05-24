@@ -5,3 +5,10 @@ class Metrics:
             if value is None and not isinstance(value, list):
                 value = -1
             setattr(self, key, value)
+
+    def to_dict(self):
+        return self.__dict__
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(**d)

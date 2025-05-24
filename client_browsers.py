@@ -1,7 +1,3 @@
-import socket
-import json
-import time
-
 from Metrics import Metrics
 import requests
 from urllib.parse import urljoin
@@ -11,11 +7,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException
 import psutil
-from multiprocessing import Process, Queue
-
-
-SERVER_HOST = '127.0.0.1'
-PERMANENT_PORT = 65431  # Fixed port for initial handshake
+import time
+import json
 
 
 def setup_browser(browser_name="chrome"):
@@ -319,94 +312,28 @@ def track_statistics(url, driver, session):
     metrics_data["failed_metrics"] = failed_metrics
     return Metrics(url, **metrics_data)
 
-
-def worker_process(url, browser_name, session_data, result_queue):
-    # Reconstruct the session
+def worker_process(url, browser_name, session_headers):
     session = requests.Session()
-    session.headers.update(session_data["headers"])
+    session.headers.update(session_headers)
+    results = []
 
-    all_metrics = []
-    for i in range(2):  # Repeat twice per browser
+    for i in range(2):  # Run twice
         driver = setup_browser(browser_name)
         try:
-            metrics_obj = track_statistics(url, driver, session)
-            all_metrics.append(metrics_obj)
-
-            print(f"[{browser_name.upper()} - Run {i + 1}] "
-                  f"Load Time: {metrics_obj.load_time:.2f}s, "
-                  f"FCP: {metrics_obj.fcp:.2f}s, "
-                  f"Memory: {metrics_obj.memory_usage:.2f}MB, "
-                  f"CPU Time: {metrics_obj.cpu_time:.2f}s, "
-                  f"DOM Nodes: {metrics_obj.dom_nodes}, "
-                  f"Page Size: {metrics_obj.total_page_size:.2f}MB, "
-                  f"Script Size: {metrics_obj.script_size:.2f}MB, "
-                  f"Requests: {metrics_obj.network_requests}, "
-                  f"Broken Links: {len(metrics_obj.broken_links)}")
+            metric = track_statistics(url, driver, session)
+            results.append(metric)  # Send Metrics object, not dict
+            print(f"[{browser_name.upper()} Run {i + 1}] Done")
         finally:
             driver.quit()
 
-    result_queue.put(all_metrics)
+    return results
 
-def connect_to_server():
-    handshake_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    handshake_socket.connect((SERVER_HOST, PERMANENT_PORT))
-    dynamic_port = recv_pickle(handshake_socket)
-    print(f"Received dynamic port: {dynamic_port}")
-    handshake_socket.close()
+def browser_loop(browser_name, url_queue, result_queue, session_headers):
+    while True:
+        url = url_queue.get()
+        if url == "exit":
+            print(f"[{browser_name}] Exiting")
+            break
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.connect((SERVER_HOST, dynamic_port))
-    print(f"Connected to server on dynamic port: {dynamic_port}")
-    return server_socket
-
-
-def main():
-    client_socket = connect_to_server()
-    session = requests.Session()
-
-    try:
-        while True:
-            url = recv_pickle(client_socket)
-
-            if url == "exit":
-                print("Exiting client.")
-                break
-
-            print(f"Received URL to test: {url}")
-
-            # Pass session headers for reconstruction
-            session_data = {"headers": dict(session.headers)}
-
-            result_queue = Queue()
-
-            browsers = ["chrome", "edge", "opera"]
-            processes = [
-                Process(target=worker_process, args=(url, browser, session_data, result_queue))
-                for browser in browsers
-            ]
-
-            for p in processes:
-                p.start()
-
-            for p in processes:
-                p.join()
-
-            # Collect results from all processes
-            all_metrics = []
-            while not result_queue.empty():
-                all_metrics.extend(result_queue.get())
-
-            # Send all metrics back to the server
-            for metrics_obj in all_metrics:
-                send_pickle(client_socket, metrics_obj)
-
-            send_pickle(client_socket, "DONE")
-            print("All metrics sent to the server.")
-
-    finally:
-        client_socket.close()
-
-
-
-if __name__ == "__main__":
-    main()
+        results = worker_process(url, browser_name, session_headers)
+        result_queue.put(results)
