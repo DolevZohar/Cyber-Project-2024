@@ -27,7 +27,9 @@ def initialize_databases():
             network_requests INTEGER,
             script_size REAL,
             broken_links TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            browser_id INTEGER,
+            is_up INTEGER
         )
     ''')
     conn.commit()
@@ -39,8 +41,11 @@ def initialize_databases():
         CREATE TABLE IF NOT EXISTS urls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT UNIQUE,
-            last_checked DATETIME DEFAULT '1970-01-01 00:00:00'
-        )
+            last_checked DATETIME DEFAULT '1970-01-01 00:00:00',
+            referenced INTEGER DEFAULT 0,
+            forceInactive INTEGER DEFAULT 0
+        );
+
     ''')
     conn.commit()
     conn.close()
@@ -51,8 +56,9 @@ def insert_metrics(metrics):
     cursor.execute('''
         INSERT INTO metrics (
             url, load_time, memory_usage, cpu_time, dom_nodes,
-            total_page_size, fcp, network_requests, script_size, broken_links
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            total_page_size, fcp, network_requests, script_size,
+            broken_links, timestamp, browser_id, is_up
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         metrics.url,
         getattr(metrics, 'load_time', None),
@@ -63,7 +69,10 @@ def insert_metrics(metrics):
         getattr(metrics, 'fcp', None),
         getattr(metrics, 'network_requests', None),
         getattr(metrics, 'script_size', None),
-        ', '.join(metrics.broken_links) if metrics.broken_links else None
+        ', '.join(metrics.broken_links) if getattr(metrics, 'broken_links', None) else None,
+        getattr(metrics, 'timestamp', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        getattr(metrics, 'browser_id', None),
+        getattr(metrics, 'is_up', None)
     ))
     conn.commit()
     conn.close()
@@ -71,7 +80,11 @@ def insert_metrics(metrics):
 def get_oldest_url():
     conn = sqlite3.connect("urls.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT url FROM urls ORDER BY last_checked ASC LIMIT 1")
+    cursor.execute("""
+        SELECT url FROM urls
+        WHERE referenced > 0 AND forceInactive = 0
+        ORDER BY last_checked ASC LIMIT 1
+    """)
     row = cursor.fetchone()
     conn.close()
     return row[0] if row else None
@@ -104,13 +117,8 @@ def handle_client(conn, addr, dynamic_port):
                 client_socket.send("exit")
                 break
 
-            normalized_url = resolve_final_url(url)
-            if not normalized_url:
-                print("Invalid or unreachable URL.")
-                client_socket.send("exit")
-                break
+            client_socket.send(url)
 
-            client_socket.send(normalized_url)
             all_metrics = []
 
             while True:
@@ -133,8 +141,8 @@ def handle_client(conn, addr, dynamic_port):
             done_signal = client_socket.receive()
             if done_signal == "DONE":
                 print("Received 'DONE' from client.")
-                update_last_checked(normalized_url)
-                print(f"Updated last checked for {normalized_url}")
+                update_last_checked(url)
+                print(f"Updated last checked for {url}")
     finally:
         conn.close()
         print(f"[Thread Exit] Client thread for {addr} exiting.")

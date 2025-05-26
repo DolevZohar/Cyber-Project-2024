@@ -10,6 +10,8 @@ import psutil
 import time
 import json
 
+BROWSER_IDS = {"chrome": 1, "edge": 2, "opera": 3}
+
 
 def setup_browser(browser_name="chrome"):
     import os
@@ -96,17 +98,25 @@ def safe_metric(name, func, metrics_dict, failed_list):
         metrics_dict[name] = None
 
 
-def track_statistics(url, driver, session):
-    browser_name = driver.capabilities.get("browserName", "").lower()
+def track_statistics(url, driver, session, browser_name):
+
+    browser_id = BROWSER_IDS.get(browser_name, 0)
+
+    is_up = 1
+    try:
+        driver.get(url)
+    except Exception as e:
+        print(f"Failed to access {url}: {e}")
+        is_up = 0
+
     # Normalize browser names
     if browser_name == "microsoftedge":
         browser_name = "edge"
 
-    if browser_name != "firefox":
-        driver.execute_cdp_cmd("Performance.disable", {})
-        driver.execute_cdp_cmd("Performance.setTimeDomain", {"timeDomain": "threadTicks"})
-        driver.execute_cdp_cmd("Performance.enable", {})
-        driver.execute_cdp_cmd("Network.enable", {})
+    driver.execute_cdp_cmd("Performance.disable", {})
+    driver.execute_cdp_cmd("Performance.setTimeDomain", {"timeDomain": "threadTicks"})
+    driver.execute_cdp_cmd("Performance.enable", {})
+    driver.execute_cdp_cmd("Network.enable", {})
 
     if browser_name in ['chrome', 'edge', 'opera']:
         driver.execute_cdp_cmd(
@@ -135,6 +145,7 @@ def track_statistics(url, driver, session):
 
     metrics_data = {}
     failed_metrics = []
+
 
     def get_load_time():
         timing = driver.execute_script("return window.performance.timing.toJSON()")
@@ -298,18 +309,21 @@ def track_statistics(url, driver, session):
         return broken
 
     # Run metrics
-    safe_metric("load_time", get_load_time, metrics_data, failed_metrics)
-    safe_metric("memory_usage", get_memory_usage, metrics_data, failed_metrics)
-    safe_metric("cpu_time", get_cpu_time, metrics_data, failed_metrics)
-    safe_metric("dom_nodes", get_dom_nodes, metrics_data, failed_metrics)
-    safe_metric("total_page_size", get_total_page_size, metrics_data, failed_metrics)
-    time.sleep(3)
-    safe_metric("fcp", get_fcp, metrics_data, failed_metrics)
-    safe_metric("network_requests", get_network_request_count, metrics_data, failed_metrics)
-    safe_metric("script_size", get_total_script_size, metrics_data, failed_metrics)
-    safe_metric("broken_links", get_broken_links, metrics_data, failed_metrics)
+    if (is_up):
+        safe_metric("load_time", get_load_time, metrics_data, failed_metrics)
+        safe_metric("memory_usage", get_memory_usage, metrics_data, failed_metrics)
+        safe_metric("cpu_time", get_cpu_time, metrics_data, failed_metrics)
+        safe_metric("dom_nodes", get_dom_nodes, metrics_data, failed_metrics)
+        safe_metric("total_page_size", get_total_page_size, metrics_data, failed_metrics)
+        time.sleep(3)
+        safe_metric("fcp", get_fcp, metrics_data, failed_metrics)
+        safe_metric("network_requests", get_network_request_count, metrics_data, failed_metrics)
+        safe_metric("script_size", get_total_script_size, metrics_data, failed_metrics)
+        safe_metric("broken_links", get_broken_links, metrics_data, failed_metrics)
 
     metrics_data["failed_metrics"] = failed_metrics
+    metrics_data["browser_id"] = browser_id
+    metrics_data["is_up"] = is_up
     return Metrics(url, **metrics_data)
 
 def worker_process(url, browser_name, session_headers):
@@ -320,7 +334,7 @@ def worker_process(url, browser_name, session_headers):
     for i in range(2):  # Run twice
         driver = setup_browser(browser_name)
         try:
-            metric = track_statistics(url, driver, session)
+            metric = track_statistics(url, driver, session, browser_name)
             results.append(metric)  # Send Metrics object, not dict
             print(f"[{browser_name.upper()} Run {i + 1}] Done")
         finally:
