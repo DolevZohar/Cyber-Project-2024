@@ -5,6 +5,8 @@ import threading
 from Metrics import Metrics
 from datetime import datetime
 from networkutils import DynamicClientSocket, HandshakeSocket
+from config import DB_PATH, METRICS_PATH
+
 
 HOST = '127.0.0.1'
 PERMANENT_PORT = 65431
@@ -12,7 +14,7 @@ shutdown_event = threading.Event()
 clients_threads = []
 
 def initialize_databases():
-    conn = sqlite3.connect("metrics.db")
+    conn = sqlite3.connect(METRICS_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS metrics (
@@ -29,13 +31,14 @@ def initialize_databases():
             broken_links TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             browser_id INTEGER,
-            is_up INTEGER
+            is_up INTEGER,
+            group_id INTEGER
         )
     ''')
     conn.commit()
     conn.close()
 
-    conn = sqlite3.connect("urls.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS urls (
@@ -45,20 +48,35 @@ def initialize_databases():
             referenced INTEGER DEFAULT 0,
             forceInactive INTEGER DEFAULT 0
         );
-
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS node_role (
+            role TEXT CHECK(role IN ('client', 'server')) NOT NULL,
+            active INTEGER DEFAULT 1 CHECK (active IN (0,1))
+        );
     ''')
     conn.commit()
     conn.close()
 
+def validate_server_role():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM node_role WHERE role = 'server' AND active = 1")
+    count = cursor.fetchone()[0]
+    conn.close()
+    if count > 1:
+        print("[ERROR] Multiple active servers detected.")
+        exit(1)
+
 def insert_metrics(metrics):
-    conn = sqlite3.connect("metrics.db")
+    conn = sqlite3.connect(METRICS_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO metrics (
             url, load_time, memory_usage, cpu_time, dom_nodes,
             total_page_size, fcp, network_requests, script_size,
-            broken_links, timestamp, browser_id, is_up
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            broken_links, timestamp, browser_id, is_up, group_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         metrics.url,
         getattr(metrics, 'load_time', None),
@@ -72,13 +90,13 @@ def insert_metrics(metrics):
         ', '.join(metrics.broken_links) if getattr(metrics, 'broken_links', None) else None,
         getattr(metrics, 'timestamp', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         getattr(metrics, 'browser_id', None),
-        getattr(metrics, 'is_up', None)
+        getattr(metrics, 'is_up', None),
+        getattr(metrics, 'group_id', None)
     ))
     conn.commit()
     conn.close()
-
 def get_oldest_url():
-    conn = sqlite3.connect("urls.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         SELECT url FROM urls
@@ -90,7 +108,7 @@ def get_oldest_url():
     return row[0] if row else None
 
 def update_last_checked(url):
-    conn = sqlite3.connect("urls.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("UPDATE urls SET last_checked = CURRENT_TIMESTAMP WHERE url = ?", (url,))
     conn.commit()
@@ -168,6 +186,7 @@ def accept_dynamic_client(dynamic_socket, dynamic_port):
 
 def start_server():
     initialize_databases()
+    validate_server_role()
     console_thread = threading.Thread(target=console_listener)
     console_thread.start()
 

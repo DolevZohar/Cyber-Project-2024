@@ -16,10 +16,11 @@ from PySide6.QtGui import QPalette, QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
+from config import DB_PATH, METRICS_PATH
+from NotificationGUI import NotificationSettingsDialog
 
-BASE_DIR = os.path.dirname(os.path.realpath(sys.argv[0]))
-DB_PATH = os.path.join(BASE_DIR, "urls.db")
-METRICS_PATH = os.path.join(BASE_DIR, "metrics.db")
+
+
 
 
 def hash_password(password):
@@ -60,7 +61,20 @@ def initialize_databases():
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(url_id) REFERENCES urls(id)
         );
+        CREATE TABLE IF NOT EXISTS client_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS node_role (
+            role TEXT CHECK(role IN ('client', 'server')) NOT NULL,
+            active INTEGER DEFAULT 1 CHECK (active IN (0,1)),
+            group_id INTEGER
+        );
     ''')
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "email" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
     # Ensure owner user exists
     cursor.execute("SELECT id FROM users WHERE username = 'owner'")
     if not cursor.fetchone():
@@ -86,7 +100,8 @@ def initialize_databases():
             broken_links TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             browser_id INTEGER,
-            is_up INTEGER
+            is_up INTEGER,
+            group_id INTEGER
         )
     ''')
     conn.commit()
@@ -148,6 +163,9 @@ class Dashboard(QWidget):
             left_layout.addWidget(cb)
         left_layout.addWidget(self.url_list)
         left_layout.addWidget(QPushButton("Log out", clicked=self.logout_callback))
+        self.notifications_btn = QPushButton("Notification Settings")
+        self.notifications_btn.clicked.connect(self.open_notifications)
+        left_layout.addWidget(self.notifications_btn)
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(QLabel("Select Metric to View"))
@@ -155,6 +173,7 @@ class Dashboard(QWidget):
         right_layout.addWidget(self.canvas)
         right_layout.addWidget(self.stats_label)
         right_layout.addWidget(self.unfollow_btn)
+
         if self.role in ("admin", "owner"):
             # --- User Management Panel ---
             user_admin_label = QLabel("User Management")
@@ -174,6 +193,31 @@ class Dashboard(QWidget):
             right_layout.addWidget(self.promote_button)
             right_layout.addWidget(self.demote_button)
 
+            self.set_client_btn = QPushButton("Run as Client")
+            self.set_server_btn = QPushButton("Run as Server")
+            self.set_client_btn.clicked.connect(self.set_as_client)
+            self.set_server_btn.clicked.connect(self.set_as_server)
+            right_layout.addWidget(self.set_client_btn)
+            right_layout.addWidget(self.set_server_btn)
+
+            self.group_manage_label = QLabel("Client Group Management")
+            self.group_manage_label.setStyleSheet("color: white; font-weight: bold")
+            self.group_create_input = QLineEdit()
+            self.group_create_input.setPlaceholderText("New Group Name")
+            self.create_group_btn = QPushButton("Create Group")
+            self.delete_group_btn = QPushButton("Delete Selected Group")
+            self.group_list = QComboBox()
+            self.refresh_group_list()
+
+            self.create_group_btn.clicked.connect(self.create_group)
+            self.delete_group_btn.clicked.connect(self.delete_group)
+
+            right_layout.addWidget(self.group_manage_label)
+            right_layout.addWidget(self.group_create_input)
+            right_layout.addWidget(self.create_group_btn)
+            right_layout.addWidget(self.group_list)
+            right_layout.addWidget(self.delete_group_btn)
+
         if self.role in ("admin", "owner"):
             self.deactivate_btn = QPushButton("Deactivate Selected URL")
             self.deactivate_btn.clicked.connect(self.deactivate_selected_url)
@@ -182,6 +226,13 @@ class Dashboard(QWidget):
             self.reactivate_btn = QPushButton("Reactivate Selected URL")
             self.reactivate_btn.clicked.connect(self.reactivate_selected_url)
             right_layout.addWidget(self.reactivate_btn)
+
+        self.group_filter = QComboBox()
+        self.group_filter.addItem("All Groups", None)
+        self.group_filter.currentIndexChanged.connect(self.update_metrics)
+        right_layout.addWidget(QLabel("Filter by Group"))
+        right_layout.addWidget(self.group_filter)
+        self.refresh_groups()
 
 
 
@@ -380,6 +431,15 @@ class Dashboard(QWidget):
         if hide_fcp:
             metric_cols.remove("fcp")
 
+        selected_gid = self.group_filter.currentData()
+        if selected_gid is not None:
+            cursor.execute(
+                f"SELECT * FROM metrics WHERE url = ? AND browser_id IN ({placeholders}) AND group_id = ? ORDER BY timestamp",
+                (url, *selected_browser_ids, selected_gid))
+        else:
+            cursor.execute(f"SELECT * FROM metrics WHERE url = ? AND browser_id IN ({placeholders}) ORDER BY timestamp",
+                           (url, *selected_browser_ids))
+
         self.metric_data = {col: [] for col in column_names if col in metric_cols}
         for row in rows:
             for i, name in enumerate(column_names):
@@ -484,6 +544,94 @@ class Dashboard(QWidget):
         conn.close()
 
         QMessageBox.information(self, "Reactivated", "The selected URL has been reactivated.")
+
+    def set_as_server(self):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS node_role (role TEXT CHECK(role IN ('client', 'server')) NOT NULL, active INTEGER DEFAULT 1 CHECK (active IN (0,1)))")
+        cursor.execute("SELECT COUNT(*) FROM node_role WHERE role = 'server' AND active = 1")
+        if cursor.fetchone()[0] > 0:
+            QMessageBox.warning(self, "Server Exists", "Another server is already active.")
+            conn.close()
+            return
+        cursor.execute("DELETE FROM node_role")
+        cursor.execute("INSERT INTO node_role (role, active) VALUES ('server', 1)")
+        conn.commit()
+        conn.close()
+        QMessageBox.information(self, "Success", "This machine is now set as SERVER.")
+        os.system("start cmd /k python server.py")
+
+    def set_as_client(self):
+        group_id = self.group_list.currentData()
+        if group_id is None:
+            QMessageBox.warning(self, "Select Group", "You must select a group before continuing.")
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS node_role (role TEXT CHECK(role IN ('client', 'server')) NOT NULL, active INTEGER DEFAULT 1, group_id INTEGER)")
+        cursor.execute("DELETE FROM node_role")
+        cursor.execute("INSERT INTO node_role (role, active, group_id) VALUES ('client', 1, ?)", (group_id,))
+        conn.commit()
+        conn.close()
+        QMessageBox.information(self, "Client Set", f"This machine is now a CLIENT in group ID {group_id}.")
+        os.system("start cmd /k python client_worker.py")
+
+    def refresh_groups(self):
+        conn = sqlite3.connect(METRICS_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT group_id FROM metrics WHERE group_id IS NOT NULL")
+        groups = cursor.fetchall()
+        for (gid,) in groups:
+            self.group_filter.addItem(f"Group {gid}", gid)
+        conn.close()
+
+    def refresh_group_list(self):
+        self.group_list.clear()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name FROM client_groups ORDER BY name")
+        for gid, name in cursor.fetchall():
+            self.group_list.addItem(f"{name} (ID {gid})", gid)
+        conn.close()
+
+    def create_group(self):
+        name = self.group_create_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Input Error", "Group name cannot be empty.")
+            return
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO client_groups (name) VALUES (?)", (name,))
+            conn.commit()
+            QMessageBox.information(self, "Success", "Group created.")
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "Error", "Group name already exists.")
+        conn.close()
+        self.refresh_group_list()
+        self.refresh_groups()
+
+    def delete_group(self):
+        group_id = self.group_list.currentData()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM node_role WHERE group_id = ?", (group_id,))
+        if cursor.fetchone()[0] > 0:
+            QMessageBox.warning(self, "Error", "Cannot delete group in use.")
+        else:
+            cursor.execute("DELETE FROM client_groups WHERE id = ?", (group_id,))
+            conn.commit()
+            QMessageBox.information(self, "Deleted", "Group deleted.")
+        conn.close()
+        self.refresh_group_list()
+        self.refresh_groups()
+
+    def open_notifications(self):
+        dialog = NotificationSettingsDialog(self.user_id)
+        dialog.exec()
 
 
 class LoginForm(QWidget):
