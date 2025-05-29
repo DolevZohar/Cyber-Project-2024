@@ -1,24 +1,28 @@
+import os
 import socket
-import sqlite3
+import psycopg2
 import requests
 import threading
 from Metrics import Metrics
 from datetime import datetime
 from networkutils import DynamicClientSocket, HandshakeSocket
-from config import DB_PATH, METRICS_PATH
+from config import get_db_conn, HANDSHAKE_PORT
+from dotenv import load_dotenv
 
 
-HOST = '127.0.0.1'
-PERMANENT_PORT = 65431
+load_dotenv()
+HOST = os.getenv('SERVER_IP')
+PERMANENT_PORT = HANDSHAKE_PORT
 shutdown_event = threading.Event()
 clients_threads = []
 
+
 def initialize_databases():
-    conn = sqlite3.connect(METRICS_PATH)
+    conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             url TEXT,
             load_time REAL,
             memory_usage REAL,
@@ -29,22 +33,17 @@ def initialize_databases():
             network_requests INTEGER,
             script_size REAL,
             broken_links TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             browser_id INTEGER,
             is_up INTEGER,
             group_id INTEGER
         )
     ''')
-    conn.commit()
-    conn.close()
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS urls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             url TEXT UNIQUE,
-            last_checked DATETIME DEFAULT '1970-01-01 00:00:00',
+            last_checked TIMESTAMP DEFAULT '1970-01-01 00:00:00',
             referenced INTEGER DEFAULT 0,
             forceInactive INTEGER DEFAULT 0
         );
@@ -58,8 +57,9 @@ def initialize_databases():
     conn.commit()
     conn.close()
 
+
 def validate_server_role():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM node_role WHERE role = 'server' AND active = 1")
     count = cursor.fetchone()[0]
@@ -68,15 +68,16 @@ def validate_server_role():
         print("[ERROR] Multiple active servers detected.")
         exit(1)
 
+
 def insert_metrics(metrics):
-    conn = sqlite3.connect(METRICS_PATH)
+    conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO metrics (
             url, load_time, memory_usage, cpu_time, dom_nodes,
             total_page_size, fcp, network_requests, script_size,
             broken_links, timestamp, browser_id, is_up, group_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ''', (
         metrics.url,
         getattr(metrics, 'load_time', None),
@@ -95,8 +96,10 @@ def insert_metrics(metrics):
     ))
     conn.commit()
     conn.close()
+
+
 def get_oldest_url():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT url FROM urls
@@ -107,12 +110,14 @@ def get_oldest_url():
     conn.close()
     return row[0] if row else None
 
+
 def update_last_checked(url):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_conn()
     cursor = conn.cursor()
-    cursor.execute("UPDATE urls SET last_checked = CURRENT_TIMESTAMP WHERE url = ?", (url,))
+    cursor.execute("UPDATE urls SET last_checked = CURRENT_TIMESTAMP WHERE url = %s", (url,))
     conn.commit()
     conn.close()
+
 
 def resolve_final_url(input_url):
     if not input_url.startswith("http://") and not input_url.startswith("https://"):
@@ -123,6 +128,7 @@ def resolve_final_url(input_url):
     except requests.RequestException as e:
         print(f"Failed to resolve URL: {e}")
         return None
+
 
 def handle_client(conn, addr, dynamic_port):
     client_socket = DynamicClientSocket(conn)
@@ -147,23 +153,30 @@ def handle_client(conn, addr, dynamic_port):
                 if obj is None:
                     print("Received None object.")
                     return
-                elif not hasattr(obj, 'url'):
+                if isinstance(obj, list):
+                    for m in obj:
+                        if isinstance(m, dict):
+                            m = Metrics.from_dict(m)
+                        if not hasattr(m, 'url'):
+                            print(f"Invalid object in list: {type(m)} - {m}")
+                            continue
+                        all_metrics.append(m)
+                elif hasattr(obj, 'url'):
+                    all_metrics.append(obj)
+                else:
                     print(f"Invalid object received: {type(obj)} - {obj}")
                     return
-                all_metrics.append(obj)
 
             for metrics in all_metrics:
                 insert_metrics(metrics)
 
             print(f"Inserted metrics for {url}. Waiting for 'DONE' signal...")
-            done_signal = client_socket.receive()
-            if done_signal == "DONE":
-                print("Received 'DONE' from client.")
-                update_last_checked(url)
-                print(f"Updated last checked for {url}")
+            update_last_checked(url)
+            print(f"Updated last checked for {url}")
     finally:
         conn.close()
         print(f"[Thread Exit] Client thread for {addr} exiting.")
+
 
 def console_listener():
     while not shutdown_event.is_set():
@@ -172,6 +185,7 @@ def console_listener():
             print("Shutdown command received.")
             shutdown_event.set()
     print("[Thread Exit] Console listener thread exiting.")
+
 
 def accept_dynamic_client(dynamic_socket, dynamic_port):
     try:
@@ -184,6 +198,7 @@ def accept_dynamic_client(dynamic_socket, dynamic_port):
         dynamic_socket.close()
         print(f"[Thread Exit] accept_dynamic_client thread for port {dynamic_port} exiting.")
 
+
 def start_server():
     initialize_databases()
     validate_server_role()
@@ -194,7 +209,7 @@ def start_server():
         handshake_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         handshake_socket.bind((HOST, PERMANENT_PORT))
         handshake_socket.listen()
-        handshake_socket.settimeout(1.0)  # 🔧 Add timeout to allow loop break
+        handshake_socket.settimeout(1.0)
 
         print(f"Server started. Handshake listener on {HOST}:{PERMANENT_PORT}")
 
@@ -203,7 +218,7 @@ def start_server():
                 try:
                     handshake_conn, handshake_addr = handshake_socket.accept()
                 except socket.timeout:
-                    continue  # Retry until shutdown_event is set
+                    continue
 
                 if shutdown_event.is_set():
                     handshake_conn.close()
@@ -241,6 +256,7 @@ def start_server():
         console_thread.join()
         print("Console thread finished.")
         print("Server shut down cleanly.")
+
 
 if __name__ == "__main__":
     start_server()

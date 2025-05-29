@@ -5,12 +5,12 @@ from client_browsers import browser_loop
 import psutil
 import os
 import sys
-import sqlite3
+import psycopg2
+from config import get_db_conn, HANDSHAKE_PORT
 
-SERVER_HOST = '127.0.0.1'
-PERMANENT_PORT = 65431
+SERVER_HOST = os.getenv("SERVER_IP")
+PERMANENT_PORT = HANDSHAKE_PORT
 BROWSERS = ["chrome", "edge", "opera"]
-
 
 LOCK_FILE = ".client.lock"
 
@@ -37,7 +37,6 @@ def remove_lock_file():
     except Exception as e:
         print(f"[WARN] Could not delete lock file: {e}")
 
-
 def connect_to_server():
     handshake = HandshakeSocket.create(SERVER_HOST, PERMANENT_PORT)
     dynamic_port = handshake.receive()
@@ -50,7 +49,7 @@ def main():
 
     write_lock_file()
 
-    conn = sqlite3.connect("urls.db")
+    conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT group_id FROM node_role WHERE role = 'client' AND active = 1")
     group_row = cursor.fetchone()
